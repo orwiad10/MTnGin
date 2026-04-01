@@ -1,0 +1,16 @@
+format: yard
+iterations: 100
+seed: 42
+max_turns: 30
+db_path: data/scryfall-oracle-cards.json
+output_path: out/report.json
+
+player1:
+  name: RedBot-A
+  deck_path: decks/yard_sample.deck
+  starting_life: 20
+
+player2:
+  name: RedBot-B
+  deck_path: decks/yard_sample.deck
+  starting_life: 20
