@@ -262,7 +262,18 @@ fn run_simulation(config_path: &Path) -> Result<()> {
 
     let output = serde_json::to_string_pretty(&report)?;
     if let Some(path) = cfg.output_path {
-        fs::write(&path, &output)?;
+        let output_path = Path::new(&path);
+        if let Some(parent) = output_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create output directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+
+        fs::write(output_path, &output)
+            .with_context(|| format!("failed to write simulation report to {}", path))?;
         println!("Simulation report written to {}", path);
     } else {
         println!("{output}");
