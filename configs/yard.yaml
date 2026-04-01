@@ -7,10 +7,10 @@ output_path: out/report.json
 
 player1:
   name: RedBot-A
-  deck_path: decks/yard_sample.deck
+  deck_path: decks/yard_sample.yaml
   starting_life: 20
 
 player2:
   name: RedBot-B
-  deck_path: decks/yard_sample.deck
+  deck_path: decks/yard_sample.yaml
   starting_life: 20
