@@ -69,6 +69,7 @@ struct ScryfallCard {
     type_line: String,
     oracle_text: Option<String>,
     cmc: f32,
+    color_identity: Option<Vec<String>>,
     power: Option<String>,
     toughness: Option<String>,
 }
@@ -79,6 +80,7 @@ struct CardProfile {
     kind: CardKind,
     cmc: u32,
     is_basic_land: bool,
+    is_mono_black_legal: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +130,8 @@ struct SimulationReport {
     player1_win_rate: f64,
     player2_win_rate: f64,
     draw_rate: f64,
+    avg_turns: f64,
+    ending_turns: Vec<usize>,
     games: Vec<GameResult>,
 }
 
@@ -210,22 +214,29 @@ fn run_simulation(config_path: &Path) -> Result<()> {
     let max_turns = cfg.max_turns.unwrap_or(30);
     let mut p1_life_sum = 0i64;
     let mut p2_life_sum = 0i64;
+    let mut turn_sum = 0usize;
 
     let seed = cfg.seed.unwrap_or(42);
     let mut rng = StdRng::seed_from_u64(seed);
     for game_number in 1..=cfg.iterations {
-        let result = simulate_game(
-            game_number,
-            &cfg,
-            &p1_deck,
-            &p2_deck,
-            &card_db,
-            max_turns,
-            &mut rng,
-        );
+        let result = if cfg.format.eq_ignore_ascii_case("yard") {
+            simulate_game_yard(game_number, &cfg, &p1_deck, &card_db, max_turns, &mut rng)
+        } else {
+            simulate_game(
+                game_number,
+                &cfg,
+                &p1_deck,
+                &p2_deck,
+                &card_db,
+                max_turns,
+                &mut rng,
+            )
+        };
 
         p1_life_sum += result.player1_life as i64;
         p2_life_sum += result.player2_life as i64;
+        turn_sum += result.turns;
+        report.ending_turns.push(result.turns);
 
         match result.winner.as_str() {
             x if x == report.player1_name => report.player1_wins += 1,
@@ -241,6 +252,7 @@ fn run_simulation(config_path: &Path) -> Result<()> {
     report.player1_win_rate = report.player1_wins as f64 / cfg.iterations as f64;
     report.player2_win_rate = report.player2_wins as f64 / cfg.iterations as f64;
     report.draw_rate = report.draws as f64 / cfg.iterations as f64;
+    report.avg_turns = turn_sum as f64 / cfg.iterations as f64;
 
     let output = serde_json::to_string_pretty(&report)?;
     if let Some(path) = cfg.output_path {
@@ -266,6 +278,13 @@ fn validate_run_config(cfg: &RunConfig) -> Result<()> {
     if cfg.player1.name.trim().is_empty() || cfg.player2.name.trim().is_empty() {
         return Err(anyhow!("player names must not be empty"));
     }
+    if cfg.format.eq_ignore_ascii_case("yard")
+        && cfg.player1.deck_path.trim() != cfg.player2.deck_path.trim()
+    {
+        return Err(anyhow!(
+            "yard format requires both players to reference the same deck_path"
+        ));
+    }
     Ok(())
 }
 
@@ -279,6 +298,10 @@ fn rules_for_format(format: &str) -> Option<FormatRules> {
             minimum_deck_size: 100,
             max_non_basic_copies: 1,
         }),
+        "yard" => Some(FormatRules {
+            minimum_deck_size: 60,
+            max_non_basic_copies: 0,
+        }),
         _ => None,
     }
 }
@@ -290,6 +313,7 @@ fn validate_deck(
 ) -> Result<()> {
     let rules =
         rules_for_format(format).ok_or_else(|| anyhow!("unsupported format '{}'", format))?;
+    let is_yard = format.eq_ignore_ascii_case("yard");
 
     if deck.len() < rules.minimum_deck_size {
         return Err(anyhow!(
@@ -311,13 +335,19 @@ fn validate_deck(
         *entry += 1;
 
         let is_basic_land = profile.is_basic_land;
-        if !is_basic_land && *entry > rules.max_non_basic_copies {
+        if !is_yard && !is_basic_land && *entry > rules.max_non_basic_copies {
             return Err(anyhow!(
                 "card '{}' has {} copies, max allowed in {} is {}",
                 profile.name,
                 entry,
                 format,
                 rules.max_non_basic_copies
+            ));
+        }
+        if is_yard && !profile.is_mono_black_legal {
+            return Err(anyhow!(
+                "yard format only allows mono-black/colorless cards; '{}' is not legal",
+                profile.name
             ));
         }
     }
@@ -408,6 +438,117 @@ fn simulate_game(
     }
 }
 
+fn simulate_game_yard(
+    game_number: usize,
+    cfg: &RunConfig,
+    shared_deck: &[DeckCard],
+    card_db: &HashMap<String, CardProfile>,
+    max_turns: usize,
+    rng: &mut StdRng,
+) -> GameResult {
+    let mut p1 = PlayerState {
+        name: cfg.player1.name.clone(),
+        life: cfg.player1.starting_life.unwrap_or(20),
+        library: Vec::new(),
+        hand: Vec::new(),
+        battlefield: Vec::new(),
+        graveyard: Vec::new(),
+        lands_in_play: 0,
+        cards_seen: HashSet::new(),
+    };
+    let mut p2 = PlayerState {
+        name: cfg.player2.name.clone(),
+        life: cfg.player2.starting_life.unwrap_or(20),
+        library: Vec::new(),
+        hand: Vec::new(),
+        battlefield: Vec::new(),
+        graveyard: Vec::new(),
+        lands_in_play: 0,
+        cards_seen: HashSet::new(),
+    };
+
+    let mut shared_library = shared_deck.to_vec();
+    shared_library.shuffle(rng);
+    let mut shared_graveyard: Vec<DeckCard> = Vec::new();
+
+    for _ in 0..7 {
+        draw_card_from_shared(&mut p1, &mut shared_library);
+        draw_card_from_shared(&mut p2, &mut shared_library);
+    }
+
+    let mut turns = 0;
+    for t in 1..=max_turns {
+        turns = t;
+        take_turn_yard(
+            &mut p1,
+            &mut p2,
+            card_db,
+            &mut shared_library,
+            &mut shared_graveyard,
+        );
+        if p2.life <= 0 {
+            break;
+        }
+        take_turn_yard(
+            &mut p2,
+            &mut p1,
+            card_db,
+            &mut shared_library,
+            &mut shared_graveyard,
+        );
+        if p1.life <= 0 {
+            break;
+        }
+    }
+
+    let winner = if p1.life <= 0 && p2.life <= 0 {
+        "Draw".to_string()
+    } else if p2.life <= 0 {
+        p1.name.clone()
+    } else if p1.life <= 0 {
+        p2.name.clone()
+    } else if p1.life > p2.life {
+        p1.name.clone()
+    } else if p2.life > p1.life {
+        p2.name.clone()
+    } else {
+        "Draw".to_string()
+    };
+
+    let mut p1_seen: Vec<String> = p1.cards_seen.into_iter().collect();
+    let mut p2_seen: Vec<String> = p2.cards_seen.into_iter().collect();
+    p1_seen.sort();
+    p2_seen.sort();
+
+    GameResult {
+        game_number,
+        winner,
+        turns,
+        player1_life: p1.life,
+        player2_life: p2.life,
+        player1_cards_seen: p1_seen,
+        player2_cards_seen: p2_seen,
+    }
+}
+
+fn take_turn_yard(
+    active: &mut PlayerState,
+    defending: &mut PlayerState,
+    card_db: &HashMap<String, CardProfile>,
+    shared_library: &mut Vec<DeckCard>,
+    shared_graveyard: &mut Vec<DeckCard>,
+) {
+    draw_card_from_shared(active, shared_library);
+
+    for c in &mut active.battlefield {
+        c.summoning_sick = false;
+    }
+
+    play_land(active, card_db);
+    cast_spells_yard(active, defending, card_db, shared_graveyard);
+    attack_step_yard(active, defending, shared_graveyard);
+}
+
 fn take_turn(
     active: &mut PlayerState,
     defending: &mut PlayerState,
@@ -426,6 +567,13 @@ fn take_turn(
 
 fn draw_card(player: &mut PlayerState) {
     if let Some(card) = player.library.pop() {
+        player.cards_seen.insert(card.name.clone());
+        player.hand.push(card);
+    }
+}
+
+fn draw_card_from_shared(player: &mut PlayerState, shared_library: &mut Vec<DeckCard>) {
+    if let Some(card) = shared_library.pop() {
         player.cards_seen.insert(card.name.clone());
         player.hand.push(card);
     }
@@ -495,6 +643,46 @@ fn cast_spells(
     }
 }
 
+fn cast_spells_yard(
+    active: &mut PlayerState,
+    defending: &mut PlayerState,
+    card_db: &HashMap<String, CardProfile>,
+    shared_graveyard: &mut Vec<DeckCard>,
+) {
+    let mut mana_available = active.lands_in_play;
+
+    loop {
+        let mut playable: Vec<(usize, u32)> = active
+            .hand
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let profile = card_profile_for(c, card_db)?;
+                if profile.cmc <= mana_available {
+                    Some((i, profile.cmc))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if playable.is_empty() {
+            break;
+        }
+        playable.sort_by_key(|(_, cmc)| *cmc);
+
+        let cast_idx = playable[0].0;
+        let card = active.hand.remove(cast_idx);
+
+        if let Some(profile) = card_profile_for(&card, card_db) {
+            mana_available = mana_available.saturating_sub(profile.cmc);
+            active.cards_seen.insert(card.name.clone());
+            resolve_spell_yard(active, defending, card, profile, shared_graveyard);
+        } else {
+            shared_graveyard.push(card);
+        }
+    }
+}
+
 fn resolve_spell(
     active: &mut PlayerState,
     defending: &mut PlayerState,
@@ -516,6 +704,32 @@ fn resolve_spell(
         }
         _ => {
             active.graveyard.push(card);
+        }
+    }
+}
+
+fn resolve_spell_yard(
+    active: &mut PlayerState,
+    defending: &mut PlayerState,
+    card: DeckCard,
+    profile: &CardProfile,
+    shared_graveyard: &mut Vec<DeckCard>,
+) {
+    match profile.kind {
+        CardKind::Creature { power, toughness } => {
+            active.battlefield.push(CreaturePermanent {
+                card_name: profile.name.clone(),
+                power,
+                toughness,
+                summoning_sick: true,
+            });
+        }
+        CardKind::Burn { damage } => {
+            defending.life -= damage;
+            put_in_yard_graveyard(active, card, shared_graveyard);
+        }
+        _ => {
+            put_in_yard_graveyard(active, card, shared_graveyard);
         }
     }
 }
@@ -571,6 +785,69 @@ fn attack_step(active: &mut PlayerState, defending: &mut PlayerState) {
     );
 }
 
+fn attack_step_yard(
+    active: &mut PlayerState,
+    defending: &mut PlayerState,
+    shared_graveyard: &mut Vec<DeckCard>,
+) {
+    let attackers: Vec<usize> = active
+        .battlefield
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.summoning_sick)
+        .map(|(i, _)| i)
+        .collect();
+
+    let blockers: Vec<usize> = defending
+        .battlefield
+        .iter()
+        .enumerate()
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut to_kill_attacker = HashSet::new();
+    let mut to_kill_blocker = HashSet::new();
+
+    for (att_i, blk_i) in attackers.iter().zip(blockers.iter()) {
+        let attacker = &active.battlefield[*att_i];
+        let blocker = &defending.battlefield[*blk_i];
+
+        if attacker.power >= blocker.toughness {
+            to_kill_blocker.insert(*blk_i);
+        }
+        if blocker.power >= attacker.toughness {
+            to_kill_attacker.insert(*att_i);
+        }
+    }
+
+    for att_i in attackers.into_iter().skip(blockers.len()) {
+        defending.life -= active.battlefield[att_i].power;
+    }
+
+    let active_deaths =
+        remove_dead_creatures_yard(&mut active.battlefield, shared_graveyard, &to_kill_attacker);
+    let defending_deaths = remove_dead_creatures_yard(
+        &mut defending.battlefield,
+        shared_graveyard,
+        &to_kill_blocker,
+    );
+
+    apply_bridge_triggers(active_deaths, active, defending);
+    apply_bridge_triggers(defending_deaths, defending, active);
+}
+
+fn put_in_yard_graveyard(
+    owner: &mut PlayerState,
+    card: DeckCard,
+    shared_graveyard: &mut Vec<DeckCard>,
+) {
+    if normalize_name(&card.name) == "bridge from below" {
+        owner.graveyard.push(card);
+    } else {
+        shared_graveyard.push(card);
+    }
+}
+
 fn remove_dead_creatures(
     battlefield: &mut Vec<CreaturePermanent>,
     graveyard: &mut Vec<DeckCard>,
@@ -587,6 +864,53 @@ fn remove_dead_creatures(
         }
     }
     *battlefield = survivors;
+}
+
+fn remove_dead_creatures_yard(
+    battlefield: &mut Vec<CreaturePermanent>,
+    shared_graveyard: &mut Vec<DeckCard>,
+    dead_indices: &HashSet<usize>,
+) -> usize {
+    let mut survivors = Vec::with_capacity(battlefield.len());
+    let mut deaths = 0usize;
+    for (i, creature) in battlefield.drain(..).enumerate() {
+        if dead_indices.contains(&i) {
+            deaths += 1;
+            shared_graveyard.push(DeckCard {
+                name: creature.card_name,
+            });
+        } else {
+            survivors.push(creature);
+        }
+    }
+    *battlefield = survivors;
+    deaths
+}
+
+fn apply_bridge_triggers(deaths: usize, dead_owner: &mut PlayerState, opponent: &mut PlayerState) {
+    for _ in 0..deaths {
+        trigger_bridge_from_below(&dead_owner.graveyard, &mut dead_owner.battlefield, 1);
+        trigger_bridge_from_below(&opponent.graveyard, &mut opponent.battlefield, 1);
+    }
+}
+
+fn trigger_bridge_from_below(
+    personal_graveyard: &[DeckCard],
+    battlefield: &mut Vec<CreaturePermanent>,
+    tokens: usize,
+) {
+    let bridge_triggers = personal_graveyard
+        .iter()
+        .filter(|card| normalize_name(&card.name) == "bridge from below")
+        .count();
+    for _ in 0..(bridge_triggers * tokens) {
+        battlefield.push(CreaturePermanent {
+            card_name: "Zombie Token".to_string(),
+            power: 2,
+            toughness: 2,
+            summoning_sick: true,
+        });
+    }
 }
 
 fn load_card_db(path: &Path) -> Result<HashMap<String, CardProfile>> {
@@ -609,11 +933,17 @@ impl CardProfile {
     fn from_scryfall(c: ScryfallCard) -> Self {
         let cmc = c.cmc.ceil() as u32;
         let kind = classify_card(&c);
+        let is_mono_black_legal = c
+            .color_identity
+            .as_ref()
+            .map(|ids| ids.iter().all(|id| id == "B"))
+            .unwrap_or(true);
         Self {
             name: c.name,
             kind,
             cmc,
             is_basic_land: c.type_line.to_lowercase().contains("basic land"),
+            is_mono_black_legal,
         }
     }
 }
@@ -658,6 +988,13 @@ fn parse_damage(text: &str) -> Option<i32> {
 }
 
 fn load_deck(path: &Path) -> Result<Vec<DeckCard>> {
+    if matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("yaml") | Some("yml")
+    ) {
+        return load_deck_from_yaml(path);
+    }
+
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read deck list at {}", path.display()))?;
 
@@ -694,6 +1031,44 @@ fn load_deck(path: &Path) -> Result<Vec<DeckCard>> {
         return Err(anyhow!("deck {} has zero cards", path.display()));
     }
 
+    Ok(deck)
+}
+
+#[derive(Debug, Deserialize)]
+struct DeckListYaml {
+    cards: Vec<DeckListYamlEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeckListYamlEntry {
+    count: usize,
+    name: String,
+}
+
+fn load_deck_from_yaml(path: &Path) -> Result<Vec<DeckCard>> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read deck list at {}", path.display()))?;
+    let parsed: DeckListYaml = serde_yaml::from_str(&raw)
+        .with_context(|| format!("invalid deck YAML at {}", path.display()))?;
+
+    let mut deck = Vec::new();
+    for entry in parsed.cards {
+        if entry.name.trim().is_empty() {
+            return Err(anyhow!(
+                "deck {} contains an empty card name",
+                path.display()
+            ));
+        }
+        for _ in 0..entry.count {
+            deck.push(DeckCard {
+                name: entry.name.clone(),
+            });
+        }
+    }
+
+    if deck.is_empty() {
+        return Err(anyhow!("deck {} has zero cards", path.display()));
+    }
     Ok(deck)
 }
 
@@ -761,5 +1136,24 @@ mod tests {
         let rules = rules_for_format("modern").unwrap();
         assert_eq!(rules.minimum_deck_size, 60);
         assert_eq!(rules.max_non_basic_copies, 4);
+    }
+
+    #[test]
+    fn test_rules_for_yard() {
+        let rules = rules_for_format("yard").unwrap();
+        assert_eq!(rules.minimum_deck_size, 60);
+    }
+
+    #[test]
+    fn test_load_deck_from_yaml() {
+        let p = std::env::temp_dir().join("mtngin_test_deck.yaml");
+        fs::write(
+            &p,
+            "cards:\n  - count: 2\n    name: Swamp\n  - count: 1\n    name: Dark Ritual\n",
+        )
+        .unwrap();
+        let deck = load_deck(&p).unwrap();
+        assert_eq!(deck.len(), 3);
+        assert_eq!(deck[0].name, "Swamp");
     }
 }

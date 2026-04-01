@@ -1,0 +1,65 @@
+cards:
+  - count: 6
+    name: Blood Pet
+  - count: 6
+    name: Bridge from Below
+  - count: 4
+    name: Cabal Therapy
+  - count: 2
+    name: Carrion Feeder
+  - count: 6
+    name: Circling Vultures
+  - count: 3
+    name: Contagion
+  - count: 4
+    name: Contract from Below
+  - count: 2
+    name: Culling the Weak
+  - count: 4
+    name: Dark Ritual
+  - count: 1
+    name: Delraich
+  - count: 4
+    name: Dread Return
+  - count: 4
+    name: Entomb
+  - count: 2
+    name: Fade from Memory
+  - count: 2
+    name: Feast of Flesh
+  - count: 1
+    name: Flare of Malice
+  - count: 4
+    name: Golgari Thug
+  - count: 4
+    name: Ichorid
+  - count: 3
+    name: Infernal Contract
+  - count: 2
+    name: Innocent Blood
+  - count: 1
+    name: Misinformation
+  - count: 6
+    name: Nether Shadow
+  - count: 1
+    name: One with Nothing
+  - count: 1
+    name: Phantasmagorian
+  - count: 4
+    name: Putrid Imp
+  - count: 2
+    name: Reanimate
+  - count: 1
+    name: Restless Dreams
+  - count: 2
+    name: Sacrifice
+  - count: 4
+    name: Songs of the Damned
+  - count: 1
+    name: Soul Spike
+  - count: 2
+    name: Stinkweed Imp
+  - count: 7
+    name: Street Wraith
+  - count: 4
+    name: Unmask

@@ -7,10 +7,15 @@ MTnGin is a terminal-based Magic: The Gathering simulation engine in Rust.
 - Bot-vs-bot simulation with simple heuristics.
 - YAML-driven runtime configuration.
 - Deck import from plain text decklists (`<count> <card name>` lines).
+- Deck import from plain text **or YAML** decklists.
 - Sideboard sections in deck files are ignored (`Sideboard` marker and following lines).
 - Local Scryfall Oracle DB bootstrap (`mtngin init`) and lookup during simulation.
 - Iteration reports with winners, life totals, turn count, and cards seen by each player.
 - Format-aware deck validation (minimum deck size + copy limits by format) for Standard/Pioneer/Modern/Legacy/Vintage/Pauper/Commander.
+- Custom `yard` format support:
+  - Mono-black/colorless card pool enforcement.
+  - Shared deck and shared graveyard with poker-style dealing from one deck list.
+  - Special handling for `Bridge from Below` in personal graveyards.
 
 ## Usage
 
@@ -30,6 +35,17 @@ Example `decks/red.deck`:
 4 Monastery Swiftspear
 4 Viashino Pyromancer
 24 Shock
+```
+
+Example YAML deck `decks/yard_sample.yaml`:
+
+```yaml
+cards:
+  - count: 6
+    name: Blood Pet
+  - count: 6
+    name: Bridge from Below
+  # ...
 ```
 
 ### 3) Create run config
