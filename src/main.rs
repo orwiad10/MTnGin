@@ -90,6 +90,7 @@ enum CardKind {
     Land,
     Creature { power: i32, toughness: i32 },
     Burn { damage: i32 },
+    ManaRitual { mana: u32 },
     OtherSpell,
 }
 
@@ -107,7 +108,37 @@ struct PlayerState {
     battlefield: Vec<CreaturePermanent>,
     graveyard: Vec<DeckCard>,
     lands_in_play: u32,
+    mana_pool: u32,
     cards_seen: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TurnPhase {
+    Untap,
+    Draw,
+    Main1,
+    Combat,
+    Main2,
+    End,
+}
+
+impl TurnPhase {
+    fn label(self) -> &'static str {
+        match self {
+            TurnPhase::Untap => "Untap",
+            TurnPhase::Draw => "Draw",
+            TurnPhase::Main1 => "Main Phase 1",
+            TurnPhase::Combat => "Combat",
+            TurnPhase::Main2 => "Main Phase 2",
+            TurnPhase::End => "End Step",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StackItem {
+    card: DeckCard,
+    profile: CardProfile,
 }
 
 #[derive(Debug, Clone)]
@@ -406,6 +437,7 @@ fn simulate_game(
         battlefield: Vec::new(),
         graveyard: Vec::new(),
         lands_in_play: 0,
+        mana_pool: 0,
         cards_seen: HashSet::new(),
     };
 
@@ -417,6 +449,7 @@ fn simulate_game(
         battlefield: Vec::new(),
         graveyard: Vec::new(),
         lands_in_play: 0,
+        mana_pool: 0,
         cards_seen: HashSet::new(),
     };
 
@@ -500,6 +533,7 @@ fn simulate_game_yard(
         battlefield: Vec::new(),
         graveyard: Vec::new(),
         lands_in_play: 0,
+        mana_pool: 0,
         cards_seen: HashSet::new(),
     };
     let mut p2 = PlayerState {
@@ -510,6 +544,7 @@ fn simulate_game_yard(
         battlefield: Vec::new(),
         graveyard: Vec::new(),
         lands_in_play: 0,
+        mana_pool: 0,
         cards_seen: HashSet::new(),
     };
 
@@ -601,6 +636,14 @@ fn take_turn_yard(
     let hand_before = active.hand.len();
     let battlefield_before = active.battlefield.len();
 
+    actions.push(format!("== {} ==", TurnPhase::Untap.label()));
+    active.mana_pool = 0;
+    for c in &mut active.battlefield {
+        c.summoning_sick = false;
+    }
+    actions.push("Untapped permanents and cleared summoning sickness.".to_string());
+
+    actions.push(format!("== {} ==", TurnPhase::Draw.label()));
     actions.push(draw_card_from_shared(active, shared_library));
     if active.life <= 0 {
         return PlayerTurnLog {
@@ -615,21 +658,40 @@ fn take_turn_yard(
         };
     }
 
-    for c in &mut active.battlefield {
-        c.summoning_sick = false;
-    }
-    actions.push("Creatures are no longer summoning sick.".to_string());
-
+    actions.push(format!("== {} ==", TurnPhase::Main1.label()));
     if let Some(action) = play_land(active, card_db) {
         actions.push(action);
     }
+    actions.extend(activate_mana_abilities_yard(
+        active,
+        card_db,
+        shared_graveyard,
+    ));
+    actions.extend(cast_priority_spells_yard(
+        active,
+        defending,
+        card_db,
+        shared_library,
+        shared_graveyard,
+    ));
     actions.extend(cast_spells_yard(
         active,
         defending,
         card_db,
         shared_graveyard,
     ));
+
+    actions.push(format!("== {} ==", TurnPhase::Combat.label()));
     actions.extend(attack_step_yard(active, defending, shared_graveyard));
+    actions.push(format!("== {} ==", TurnPhase::Main2.label()));
+    actions.extend(cast_spells_yard(
+        active,
+        defending,
+        card_db,
+        shared_graveyard,
+    ));
+    actions.push(format!("== {} ==", TurnPhase::End.label()));
+    active.mana_pool = 0;
     PlayerTurnLog {
         player_name: active.name.clone(),
         life_before,
@@ -652,6 +714,14 @@ fn take_turn(
     let hand_before = active.hand.len();
     let battlefield_before = active.battlefield.len();
 
+    actions.push(format!("== {} ==", TurnPhase::Untap.label()));
+    active.mana_pool = 0;
+    for c in &mut active.battlefield {
+        c.summoning_sick = false;
+    }
+    actions.push("Untapped permanents and cleared summoning sickness.".to_string());
+
+    actions.push(format!("== {} ==", TurnPhase::Draw.label()));
     actions.push(draw_card(active));
     if active.life <= 0 {
         return PlayerTurnLog {
@@ -666,16 +736,17 @@ fn take_turn(
         };
     }
 
-    for c in &mut active.battlefield {
-        c.summoning_sick = false;
-    }
-    actions.push("Creatures are no longer summoning sick.".to_string());
-
+    actions.push(format!("== {} ==", TurnPhase::Main1.label()));
     if let Some(action) = play_land(active, card_db) {
         actions.push(action);
     }
     actions.extend(cast_spells(active, defending, card_db));
+    actions.push(format!("== {} ==", TurnPhase::Combat.label()));
     actions.extend(attack_step(active, defending));
+    actions.push(format!("== {} ==", TurnPhase::Main2.label()));
+    actions.extend(cast_spells(active, defending, card_db));
+    actions.push(format!("== {} ==", TurnPhase::End.label()));
+    active.mana_pool = 0;
     PlayerTurnLog {
         player_name: active.name.clone(),
         life_before,
@@ -737,7 +808,7 @@ fn cast_spells(
     card_db: &HashMap<String, CardProfile>,
 ) -> Vec<String> {
     let mut actions = Vec::new();
-    let mut mana_available = active.lands_in_play;
+    let mut mana_available = active.lands_in_play + active.mana_pool;
 
     loop {
         let mut playable: Vec<(usize, u32)> = active
@@ -777,12 +848,25 @@ fn cast_spells(
         if let Some(profile) = card_profile_for(&card, card_db) {
             mana_available = mana_available.saturating_sub(profile.cmc);
             active.cards_seen.insert(card.name.clone());
-            actions.push(resolve_spell(active, defending, card, profile));
+            let mut stack = vec![StackItem {
+                card,
+                profile: profile.clone(),
+            }];
+            actions.push(format!("Put {} on the stack.", card_name));
+            actions.extend(resolve_stack(
+                &mut stack,
+                active,
+                defending,
+                card_db,
+                false,
+                &mut Vec::new(),
+            ));
         } else {
             actions.push(format!("Cast unknown spell {}.", card_name));
-            active.graveyard.push(card);
+            active.graveyard.push(DeckCard { name: card_name });
         }
     }
+    active.mana_pool = mana_available.saturating_sub(active.lands_in_play);
     actions
 }
 
@@ -793,7 +877,7 @@ fn cast_spells_yard(
     shared_graveyard: &mut Vec<DeckCard>,
 ) -> Vec<String> {
     let mut actions = Vec::new();
-    let mut mana_available = active.lands_in_play;
+    let mut mana_available = active.lands_in_play + active.mana_pool;
 
     loop {
         let mut playable: Vec<(usize, u32)> = active
@@ -814,23 +898,235 @@ fn cast_spells_yard(
         }
         playable.sort_by_key(|(_, cmc)| Reverse(*cmc));
 
-        let cast_idx = playable[0].0;
+        let cast_idx = choose_best_yard_spell(active, defending, card_db, &playable);
         let card = active.hand.remove(cast_idx);
         let card_name = card.name.clone();
 
         if let Some(profile) = card_profile_for(&card, card_db) {
-            mana_available = mana_available.saturating_sub(profile.cmc);
+            let effective_cost = effective_yard_cost(&card_name, profile.cmc);
+            mana_available = mana_available.saturating_sub(effective_cost);
+            if let CardKind::ManaRitual { mana } = profile.kind {
+                mana_available = mana_available.saturating_add(mana);
+            }
             active.cards_seen.insert(card.name.clone());
-            actions.push(resolve_spell_yard(
+            let mut stack = vec![StackItem {
+                card,
+                profile: profile.clone(),
+            }];
+            actions.push(format!("Put {} on the stack.", card_name));
+            actions.extend(resolve_stack(
+                &mut stack,
                 active,
                 defending,
-                card,
-                profile,
+                card_db,
+                true,
                 shared_graveyard,
             ));
         } else {
             actions.push(format!("Cast unknown shared spell {}.", card_name));
-            shared_graveyard.push(card);
+            shared_graveyard.push(DeckCard { name: card_name });
+        }
+    }
+    active.mana_pool = mana_available.saturating_sub(active.lands_in_play);
+    actions
+}
+
+fn maybe_response_spell(
+    responder: &mut PlayerState,
+    opponent: &PlayerState,
+    card_db: &HashMap<String, CardProfile>,
+    yard_mode: bool,
+) -> Option<StackItem> {
+    let mana_available = responder.lands_in_play + responder.mana_pool;
+    let lethal_idx = responder.hand.iter().enumerate().find_map(|(i, card)| {
+        let profile = card_profile_for(card, card_db)?;
+        if profile.cmc > mana_available {
+            return None;
+        }
+        if let CardKind::Burn { damage } = profile.kind {
+            if damage >= opponent.life {
+                return Some(i);
+            }
+        }
+        None
+    })?;
+
+    let card = responder.hand.remove(lethal_idx);
+    let profile = card_profile_for(&card, card_db)?.clone();
+    let cost = if yard_mode {
+        effective_yard_cost(&card.name, profile.cmc)
+    } else {
+        profile.cmc
+    };
+    responder.mana_pool = (responder.lands_in_play + responder.mana_pool).saturating_sub(cost);
+    Some(StackItem { card, profile })
+}
+
+fn choose_best_yard_spell(
+    active: &PlayerState,
+    defending: &PlayerState,
+    card_db: &HashMap<String, CardProfile>,
+    playable: &[(usize, u32)],
+) -> usize {
+    if let Some((idx, _)) = playable.iter().find(|(i, _)| {
+        card_profile_for(&active.hand[*i], card_db)
+            .map(|p| matches!(p.kind, CardKind::Burn { damage } if damage >= defending.life))
+            .unwrap_or(false)
+    }) {
+        return *idx;
+    }
+    if let Some((idx, _)) = playable.iter().find(|(i, _)| {
+        normalize_name(&active.hand[*i].name) == "reanimate" && !defending.graveyard.is_empty()
+    }) {
+        return *idx;
+    }
+    playable[0].0
+}
+
+fn effective_yard_cost(card_name: &str, base_cmc: u32) -> u32 {
+    match normalize_name(card_name).as_str() {
+        "street wraith" => 0,
+        "contagion" => 0,
+        _ => base_cmc,
+    }
+}
+
+fn cast_priority_spells_yard(
+    active: &mut PlayerState,
+    defending: &mut PlayerState,
+    card_db: &HashMap<String, CardProfile>,
+    shared_library: &mut Vec<DeckCard>,
+    shared_graveyard: &mut Vec<DeckCard>,
+) -> Vec<String> {
+    let mut actions = Vec::new();
+    loop {
+        let Some(idx) = active
+            .hand
+            .iter()
+            .position(|c| normalize_name(&c.name) == "street wraith")
+        else {
+            break;
+        };
+        if active.life <= 2 {
+            break;
+        }
+        let wraith = active.hand.remove(idx);
+        active.life -= 2;
+        put_in_yard_graveyard(active, wraith, shared_graveyard);
+        actions.push(format!(
+            "Cycled Street Wraith by paying 2 life ({} life now {}).",
+            active.name, active.life
+        ));
+        actions.push(draw_card_from_shared(active, shared_library));
+    }
+
+    if let Some(idx) = active
+        .hand
+        .iter()
+        .position(|c| normalize_name(&c.name) == "reanimate")
+    {
+        let targets = defending
+            .graveyard
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let p = card_profile_for(c, card_db)?;
+                if let CardKind::Creature { power, toughness } = p.kind {
+                    Some((i, p.name.clone(), power, toughness, p.cmc))
+                } else {
+                    None
+                }
+            })
+            .max_by_key(|(_, _, power, _, _)| *power);
+        if let Some((target_idx, target_name, power, toughness, cmc)) = targets {
+            active.hand.remove(idx);
+            let resurrected = defending.graveyard.remove(target_idx);
+            active.life -= cmc as i32;
+            active.battlefield.push(CreaturePermanent {
+                card_name: target_name.clone(),
+                power,
+                toughness,
+                summoning_sick: true,
+            });
+            put_in_yard_graveyard(
+                active,
+                DeckCard {
+                    name: "Reanimate".to_string(),
+                },
+                shared_graveyard,
+            );
+            actions.push(format!(
+                "Cast Reanimate targeting {} (lost {} life, {} life now).",
+                target_name, cmc, active.life
+            ));
+            put_in_yard_graveyard(defending, resurrected, shared_graveyard);
+        }
+    }
+    actions
+}
+
+fn activate_mana_abilities_yard(
+    active: &mut PlayerState,
+    card_db: &HashMap<String, CardProfile>,
+    shared_graveyard: &mut Vec<DeckCard>,
+) -> Vec<String> {
+    let mut actions = Vec::new();
+    while let Some(idx) = active
+        .battlefield
+        .iter()
+        .position(|c| normalize_name(&c.card_name) == "blood pet")
+    {
+        let need_mana = active.hand.iter().any(|c| {
+            card_profile_for(c, card_db)
+                .map(|p| p.cmc > active.lands_in_play + active.mana_pool)
+                .unwrap_or(false)
+        });
+        if !need_mana {
+            break;
+        }
+        let pet = active.battlefield.remove(idx);
+        active.mana_pool += 1;
+        shared_graveyard.push(DeckCard {
+            name: pet.card_name.clone(),
+        });
+        actions.push(format!(
+            "Activated Blood Pet: sacrificed for {{B}} (pool {}).",
+            active.mana_pool
+        ));
+    }
+    actions
+}
+
+fn resolve_stack(
+    stack: &mut Vec<StackItem>,
+    active: &mut PlayerState,
+    defending: &mut PlayerState,
+    card_db: &HashMap<String, CardProfile>,
+    yard_mode: bool,
+    shared_graveyard: &mut Vec<DeckCard>,
+) -> Vec<String> {
+    let mut actions = Vec::new();
+    while let Some(item) = stack.pop() {
+        if let Some(response) = maybe_response_spell(defending, active, card_db, yard_mode) {
+            actions.push(format!(
+                "{} responds with {}.",
+                defending.name, response.profile.name
+            ));
+            stack.push(item);
+            stack.push(response);
+            continue;
+        }
+
+        if yard_mode {
+            actions.push(resolve_spell_yard(
+                active,
+                defending,
+                item.card,
+                &item.profile,
+                shared_graveyard,
+            ));
+        } else {
+            actions.push(resolve_spell(active, defending, item.card, &item.profile));
         }
     }
     actions
@@ -858,6 +1154,14 @@ fn resolve_spell(
             format!(
                 "Cast burn {} for {} damage to {} (life now {}).",
                 profile.name, damage, defending.name, defending.life
+            )
+        }
+        CardKind::ManaRitual { mana } => {
+            active.mana_pool += mana;
+            active.graveyard.push(card);
+            format!(
+                "Resolved ritual {} and added {} mana (pool {}).",
+                profile.name, mana, active.mana_pool
             )
         }
         _ => {
@@ -890,6 +1194,14 @@ fn resolve_spell_yard(
             format!(
                 "Cast burn {} for {} damage to {} (life now {}).",
                 profile.name, damage, defending.name, defending.life
+            )
+        }
+        CardKind::ManaRitual { mana } => {
+            active.mana_pool += mana;
+            put_in_yard_graveyard(active, card, shared_graveyard);
+            format!(
+                "Resolved ritual {} and added {} mana (pool {}).",
+                profile.name, mana, active.mana_pool
             )
         }
         _ => {
@@ -1163,6 +1475,9 @@ fn classify_card(card: &ScryfallCard) -> CardKind {
     }
 
     if let Some(text) = &card.oracle_text {
+        if let Some(mana) = parse_mana_ritual(text) {
+            return CardKind::ManaRitual { mana };
+        }
         if let Some(dmg) = parse_damage(text) {
             return CardKind::Burn { damage: dmg };
         }
@@ -1183,6 +1498,18 @@ fn parse_damage(text: &str) -> Option<i32> {
     let lower = text.to_lowercase();
     let captures = re.captures(&lower)?;
     captures.get(1)?.as_str().parse::<i32>().ok()
+}
+
+fn parse_mana_ritual(text: &str) -> Option<u32> {
+    let lower = text.to_lowercase();
+    if !lower.contains("add") {
+        return None;
+    }
+    let black_count = lower.matches("{b}").count() as u32;
+    if black_count > 0 {
+        return Some(black_count);
+    }
+    None
 }
 
 fn load_deck(path: &Path) -> Result<Vec<DeckCard>> {
@@ -1365,6 +1692,7 @@ mod tests {
             battlefield: Vec::new(),
             graveyard: Vec::new(),
             lands_in_play: 0,
+            mana_pool: 0,
             cards_seen: HashSet::new(),
         };
         let action = draw_card(&mut player);
@@ -1387,6 +1715,7 @@ mod tests {
             }],
             graveyard: Vec::new(),
             lands_in_play: 0,
+            mana_pool: 0,
             cards_seen: HashSet::new(),
         };
         let mut defending = PlayerState {
@@ -1397,6 +1726,7 @@ mod tests {
             battlefield: Vec::new(),
             graveyard: Vec::new(),
             lands_in_play: 0,
+            mana_pool: 0,
             cards_seen: HashSet::new(),
         };
         let actions = attack_step(&mut active, &mut defending);
