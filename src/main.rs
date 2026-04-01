@@ -146,6 +146,26 @@ struct GameResult {
     player2_life: i32,
     player1_cards_seen: Vec<String>,
     player2_cards_seen: Vec<String>,
+    turn_logs: Vec<TurnLog>,
+}
+
+#[derive(Debug, Serialize)]
+struct TurnLog {
+    turn: usize,
+    player1: PlayerTurnLog,
+    player2: Option<PlayerTurnLog>,
+}
+
+#[derive(Debug, Serialize)]
+struct PlayerTurnLog {
+    player_name: String,
+    life_before: i32,
+    life_after: i32,
+    hand_before: usize,
+    hand_after: usize,
+    battlefield_before: usize,
+    battlefield_after: usize,
+    actions: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -265,10 +285,7 @@ fn run_simulation(config_path: &Path) -> Result<()> {
         let output_path = Path::new(&path);
         if let Some(parent) = output_path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create output directory {}",
-                    parent.display()
-                )
+                format!("failed to create output directory {}", parent.display())
             })?;
         }
 
@@ -407,19 +424,30 @@ fn simulate_game(
     p2.library.shuffle(rng);
 
     for _ in 0..7 {
-        draw_card(&mut p1);
-        draw_card(&mut p2);
+        let _ = draw_card(&mut p1);
+        let _ = draw_card(&mut p2);
     }
 
     let mut turns = 0;
+    let mut turn_logs = Vec::new();
     for t in 1..=max_turns {
         turns = t;
-        take_turn(&mut p1, &mut p2, card_db);
+        let p1_turn = take_turn(&mut p1, &mut p2, card_db);
         if p2.life <= 0 {
+            turn_logs.push(TurnLog {
+                turn: t,
+                player1: p1_turn,
+                player2: None,
+            });
             break;
         }
 
-        take_turn(&mut p2, &mut p1, card_db);
+        let p2_turn = take_turn(&mut p2, &mut p1, card_db);
+        turn_logs.push(TurnLog {
+            turn: t,
+            player1: p1_turn,
+            player2: Some(p2_turn),
+        });
         if p1.life <= 0 {
             break;
         }
@@ -452,6 +480,7 @@ fn simulate_game(
         player2_life: p2.life,
         player1_cards_seen: p1_seen,
         player2_cards_seen: p2_seen,
+        turn_logs,
     }
 }
 
@@ -489,14 +518,15 @@ fn simulate_game_yard(
     let mut shared_graveyard: Vec<DeckCard> = Vec::new();
 
     for _ in 0..7 {
-        draw_card_from_shared(&mut p1, &mut shared_library);
-        draw_card_from_shared(&mut p2, &mut shared_library);
+        let _ = draw_card_from_shared(&mut p1, &mut shared_library);
+        let _ = draw_card_from_shared(&mut p2, &mut shared_library);
     }
 
     let mut turns = 0;
+    let mut turn_logs = Vec::new();
     for t in 1..=max_turns {
         turns = t;
-        take_turn_yard(
+        let p1_turn = take_turn_yard(
             &mut p1,
             &mut p2,
             card_db,
@@ -504,15 +534,25 @@ fn simulate_game_yard(
             &mut shared_graveyard,
         );
         if p2.life <= 0 {
+            turn_logs.push(TurnLog {
+                turn: t,
+                player1: p1_turn,
+                player2: None,
+            });
             break;
         }
-        take_turn_yard(
+        let p2_turn = take_turn_yard(
             &mut p2,
             &mut p1,
             card_db,
             &mut shared_library,
             &mut shared_graveyard,
         );
+        turn_logs.push(TurnLog {
+            turn: t,
+            player1: p1_turn,
+            player2: Some(p2_turn),
+        });
         if p1.life <= 0 {
             break;
         }
@@ -545,6 +585,7 @@ fn simulate_game_yard(
         player2_life: p2.life,
         player1_cards_seen: p1_seen,
         player2_cards_seen: p2_seen,
+        turn_logs,
     }
 }
 
@@ -554,49 +595,124 @@ fn take_turn_yard(
     card_db: &HashMap<String, CardProfile>,
     shared_library: &mut Vec<DeckCard>,
     shared_graveyard: &mut Vec<DeckCard>,
-) {
-    draw_card_from_shared(active, shared_library);
+) -> PlayerTurnLog {
+    let mut actions = Vec::new();
+    let life_before = active.life;
+    let hand_before = active.hand.len();
+    let battlefield_before = active.battlefield.len();
+
+    actions.push(draw_card_from_shared(active, shared_library));
+    if active.life <= 0 {
+        return PlayerTurnLog {
+            player_name: active.name.clone(),
+            life_before,
+            life_after: active.life,
+            hand_before,
+            hand_after: active.hand.len(),
+            battlefield_before,
+            battlefield_after: active.battlefield.len(),
+            actions,
+        };
+    }
 
     for c in &mut active.battlefield {
         c.summoning_sick = false;
     }
+    actions.push("Creatures are no longer summoning sick.".to_string());
 
-    play_land(active, card_db);
-    cast_spells_yard(active, defending, card_db, shared_graveyard);
-    attack_step_yard(active, defending, shared_graveyard);
+    if let Some(action) = play_land(active, card_db) {
+        actions.push(action);
+    }
+    actions.extend(cast_spells_yard(
+        active,
+        defending,
+        card_db,
+        shared_graveyard,
+    ));
+    actions.extend(attack_step_yard(active, defending, shared_graveyard));
+    PlayerTurnLog {
+        player_name: active.name.clone(),
+        life_before,
+        life_after: active.life,
+        hand_before,
+        hand_after: active.hand.len(),
+        battlefield_before,
+        battlefield_after: active.battlefield.len(),
+        actions,
+    }
 }
 
 fn take_turn(
     active: &mut PlayerState,
     defending: &mut PlayerState,
     card_db: &HashMap<String, CardProfile>,
-) {
-    draw_card(active);
+) -> PlayerTurnLog {
+    let mut actions = Vec::new();
+    let life_before = active.life;
+    let hand_before = active.hand.len();
+    let battlefield_before = active.battlefield.len();
+
+    actions.push(draw_card(active));
+    if active.life <= 0 {
+        return PlayerTurnLog {
+            player_name: active.name.clone(),
+            life_before,
+            life_after: active.life,
+            hand_before,
+            hand_after: active.hand.len(),
+            battlefield_before,
+            battlefield_after: active.battlefield.len(),
+            actions,
+        };
+    }
 
     for c in &mut active.battlefield {
         c.summoning_sick = false;
     }
+    actions.push("Creatures are no longer summoning sick.".to_string());
 
-    play_land(active, card_db);
-    cast_spells(active, defending, card_db);
-    attack_step(active, defending);
+    if let Some(action) = play_land(active, card_db) {
+        actions.push(action);
+    }
+    actions.extend(cast_spells(active, defending, card_db));
+    actions.extend(attack_step(active, defending));
+    PlayerTurnLog {
+        player_name: active.name.clone(),
+        life_before,
+        life_after: active.life,
+        hand_before,
+        hand_after: active.hand.len(),
+        battlefield_before,
+        battlefield_after: active.battlefield.len(),
+        actions,
+    }
 }
 
-fn draw_card(player: &mut PlayerState) {
+fn draw_card(player: &mut PlayerState) -> String {
     if let Some(card) = player.library.pop() {
         player.cards_seen.insert(card.name.clone());
+        let card_name = card.name.clone();
         player.hand.push(card);
+        format!("Drew card: {}", card_name)
+    } else {
+        player.life = 0;
+        "Tried to draw from empty library and lost the game.".to_string()
     }
 }
 
-fn draw_card_from_shared(player: &mut PlayerState, shared_library: &mut Vec<DeckCard>) {
+fn draw_card_from_shared(player: &mut PlayerState, shared_library: &mut Vec<DeckCard>) -> String {
     if let Some(card) = shared_library.pop() {
         player.cards_seen.insert(card.name.clone());
+        let card_name = card.name.clone();
         player.hand.push(card);
+        format!("Drew shared card: {}", card_name)
+    } else {
+        player.life = 0;
+        "Tried to draw from empty shared library and lost the game.".to_string()
     }
 }
 
-fn play_land(player: &mut PlayerState, card_db: &HashMap<String, CardProfile>) {
+fn play_land(player: &mut PlayerState, card_db: &HashMap<String, CardProfile>) -> Option<String> {
     if let Some((idx, _)) = player
         .hand
         .iter()
@@ -604,16 +720,23 @@ fn play_land(player: &mut PlayerState, card_db: &HashMap<String, CardProfile>) {
         .find(|(_, c)| matches!(card_kind_for(c, card_db), CardKind::Land))
     {
         let land = player.hand.remove(idx);
+        let land_name = land.name.clone();
         player.cards_seen.insert(land.name);
         player.lands_in_play += 1;
+        return Some(format!(
+            "Played land: {} (lands in play: {}).",
+            land_name, player.lands_in_play
+        ));
     }
+    None
 }
 
 fn cast_spells(
     active: &mut PlayerState,
     defending: &mut PlayerState,
     card_db: &HashMap<String, CardProfile>,
-) {
+) -> Vec<String> {
+    let mut actions = Vec::new();
     let mut mana_available = active.lands_in_play;
 
     loop {
@@ -635,7 +758,7 @@ fn cast_spells(
             break;
         }
 
-        playable.sort_by_key(|(_, cmc)| *cmc);
+        playable.sort_by_key(|(_, cmc)| Reverse(*cmc));
 
         let burn_idx = playable.iter().find_map(|(i, _)| {
             let profile = card_profile_for(&active.hand[*i], card_db)?;
@@ -649,15 +772,18 @@ fn cast_spells(
 
         let cast_idx = burn_idx.unwrap_or(playable[0].0);
         let card = active.hand.remove(cast_idx);
+        let card_name = card.name.clone();
 
         if let Some(profile) = card_profile_for(&card, card_db) {
             mana_available = mana_available.saturating_sub(profile.cmc);
             active.cards_seen.insert(card.name.clone());
-            resolve_spell(active, defending, card, profile);
+            actions.push(resolve_spell(active, defending, card, profile));
         } else {
+            actions.push(format!("Cast unknown spell {}.", card_name));
             active.graveyard.push(card);
         }
     }
+    actions
 }
 
 fn cast_spells_yard(
@@ -665,7 +791,8 @@ fn cast_spells_yard(
     defending: &mut PlayerState,
     card_db: &HashMap<String, CardProfile>,
     shared_graveyard: &mut Vec<DeckCard>,
-) {
+) -> Vec<String> {
+    let mut actions = Vec::new();
     let mut mana_available = active.lands_in_play;
 
     loop {
@@ -685,19 +812,28 @@ fn cast_spells_yard(
         if playable.is_empty() {
             break;
         }
-        playable.sort_by_key(|(_, cmc)| *cmc);
+        playable.sort_by_key(|(_, cmc)| Reverse(*cmc));
 
         let cast_idx = playable[0].0;
         let card = active.hand.remove(cast_idx);
+        let card_name = card.name.clone();
 
         if let Some(profile) = card_profile_for(&card, card_db) {
             mana_available = mana_available.saturating_sub(profile.cmc);
             active.cards_seen.insert(card.name.clone());
-            resolve_spell_yard(active, defending, card, profile, shared_graveyard);
+            actions.push(resolve_spell_yard(
+                active,
+                defending,
+                card,
+                profile,
+                shared_graveyard,
+            ));
         } else {
+            actions.push(format!("Cast unknown shared spell {}.", card_name));
             shared_graveyard.push(card);
         }
     }
+    actions
 }
 
 fn resolve_spell(
@@ -705,7 +841,7 @@ fn resolve_spell(
     defending: &mut PlayerState,
     card: DeckCard,
     profile: &CardProfile,
-) {
+) -> String {
     match profile.kind {
         CardKind::Creature { power, toughness } => {
             active.battlefield.push(CreaturePermanent {
@@ -714,13 +850,19 @@ fn resolve_spell(
                 toughness,
                 summoning_sick: true,
             });
+            format!("Cast creature {} ({}/{})", profile.name, power, toughness)
         }
         CardKind::Burn { damage } => {
             defending.life -= damage;
             active.graveyard.push(card);
+            format!(
+                "Cast burn {} for {} damage to {} (life now {}).",
+                profile.name, damage, defending.name, defending.life
+            )
         }
         _ => {
             active.graveyard.push(card);
+            format!("Cast spell {}.", profile.name)
         }
     }
 }
@@ -731,7 +873,7 @@ fn resolve_spell_yard(
     card: DeckCard,
     profile: &CardProfile,
     shared_graveyard: &mut Vec<DeckCard>,
-) {
+) -> String {
     match profile.kind {
         CardKind::Creature { power, toughness } => {
             active.battlefield.push(CreaturePermanent {
@@ -740,18 +882,25 @@ fn resolve_spell_yard(
                 toughness,
                 summoning_sick: true,
             });
+            format!("Cast creature {} ({}/{})", profile.name, power, toughness)
         }
         CardKind::Burn { damage } => {
             defending.life -= damage;
             put_in_yard_graveyard(active, card, shared_graveyard);
+            format!(
+                "Cast burn {} for {} damage to {} (life now {}).",
+                profile.name, damage, defending.name, defending.life
+            )
         }
         _ => {
             put_in_yard_graveyard(active, card, shared_graveyard);
+            format!("Cast spell {}.", profile.name)
         }
     }
 }
 
-fn attack_step(active: &mut PlayerState, defending: &mut PlayerState) {
+fn attack_step(active: &mut PlayerState, defending: &mut PlayerState) -> Vec<String> {
+    let mut actions = Vec::new();
     let mut attackers: Vec<usize> = active
         .battlefield
         .iter()
@@ -787,40 +936,56 @@ fn attack_step(active: &mut PlayerState, defending: &mut PlayerState) {
 
     let unblocked = attackers.len().saturating_sub(blockers.len());
     for att_i in attackers.into_iter().skip(blockers.len()).take(unblocked) {
-        defending.life -= active.battlefield[att_i].power;
+        let dmg = active.battlefield[att_i].power;
+        let attacker_name = active.battlefield[att_i].card_name.clone();
+        defending.life -= dmg;
+        actions.push(format!(
+            "{} attacked unblocked for {} damage ({} life: {}).",
+            attacker_name, dmg, defending.name, defending.life
+        ));
     }
 
-    remove_dead_creatures(
+    let attacker_deaths = remove_dead_creatures(
         &mut active.battlefield,
         &mut active.graveyard,
         &to_kill_attacker,
     );
-    remove_dead_creatures(
+    let blocker_deaths = remove_dead_creatures(
         &mut defending.battlefield,
         &mut defending.graveyard,
         &to_kill_blocker,
     );
+    if attacker_deaths > 0 || blocker_deaths > 0 {
+        actions.push(format!(
+            "Combat trades: attackers lost {}, blockers lost {}.",
+            attacker_deaths, blocker_deaths
+        ));
+    }
+    actions
 }
 
 fn attack_step_yard(
     active: &mut PlayerState,
     defending: &mut PlayerState,
     shared_graveyard: &mut Vec<DeckCard>,
-) {
-    let attackers: Vec<usize> = active
+) -> Vec<String> {
+    let mut actions = Vec::new();
+    let mut attackers: Vec<usize> = active
         .battlefield
         .iter()
         .enumerate()
         .filter(|(_, c)| !c.summoning_sick)
         .map(|(i, _)| i)
         .collect();
+    attackers.sort_by_key(|&i| Reverse(active.battlefield[i].power));
 
-    let blockers: Vec<usize> = defending
+    let mut blockers: Vec<usize> = defending
         .battlefield
         .iter()
         .enumerate()
         .map(|(i, _)| i)
         .collect();
+    blockers.sort_by_key(|&i| Reverse(defending.battlefield[i].toughness));
 
     let mut to_kill_attacker = HashSet::new();
     let mut to_kill_blocker = HashSet::new();
@@ -838,7 +1003,13 @@ fn attack_step_yard(
     }
 
     for att_i in attackers.into_iter().skip(blockers.len()) {
-        defending.life -= active.battlefield[att_i].power;
+        let dmg = active.battlefield[att_i].power;
+        let attacker_name = active.battlefield[att_i].card_name.clone();
+        defending.life -= dmg;
+        actions.push(format!(
+            "{} attacked unblocked for {} damage ({} life: {}).",
+            attacker_name, dmg, defending.name, defending.life
+        ));
     }
 
     let active_deaths =
@@ -851,6 +1022,13 @@ fn attack_step_yard(
 
     apply_bridge_triggers(active_deaths, active, defending);
     apply_bridge_triggers(defending_deaths, defending, active);
+    if active_deaths > 0 || defending_deaths > 0 {
+        actions.push(format!(
+            "Combat trades: attackers lost {}, blockers lost {}.",
+            active_deaths, defending_deaths
+        ));
+    }
+    actions
 }
 
 fn put_in_yard_graveyard(
@@ -869,10 +1047,12 @@ fn remove_dead_creatures(
     battlefield: &mut Vec<CreaturePermanent>,
     graveyard: &mut Vec<DeckCard>,
     dead_indices: &HashSet<usize>,
-) {
+) -> usize {
     let mut survivors = Vec::with_capacity(battlefield.len());
+    let mut deaths = 0usize;
     for (i, creature) in battlefield.drain(..).enumerate() {
         if dead_indices.contains(&i) {
+            deaths += 1;
             graveyard.push(DeckCard {
                 name: creature.card_name,
             });
@@ -881,6 +1061,7 @@ fn remove_dead_creatures(
         }
     }
     *battlefield = survivors;
+    deaths
 }
 
 fn remove_dead_creatures_yard(
@@ -1172,5 +1353,54 @@ mod tests {
         let deck = load_deck(&p).unwrap();
         assert_eq!(deck.len(), 3);
         assert_eq!(deck[0].name, "Swamp");
+    }
+
+    #[test]
+    fn test_draw_from_empty_library_loses_game() {
+        let mut player = PlayerState {
+            name: "P1".to_string(),
+            life: 20,
+            library: Vec::new(),
+            hand: Vec::new(),
+            battlefield: Vec::new(),
+            graveyard: Vec::new(),
+            lands_in_play: 0,
+            cards_seen: HashSet::new(),
+        };
+        let action = draw_card(&mut player);
+        assert!(action.contains("lost the game"));
+        assert_eq!(player.life, 0);
+    }
+
+    #[test]
+    fn test_attack_step_reports_unblocked_damage() {
+        let mut active = PlayerState {
+            name: "Atk".to_string(),
+            life: 20,
+            library: Vec::new(),
+            hand: Vec::new(),
+            battlefield: vec![CreaturePermanent {
+                card_name: "Bear".to_string(),
+                power: 2,
+                toughness: 2,
+                summoning_sick: false,
+            }],
+            graveyard: Vec::new(),
+            lands_in_play: 0,
+            cards_seen: HashSet::new(),
+        };
+        let mut defending = PlayerState {
+            name: "Def".to_string(),
+            life: 20,
+            library: Vec::new(),
+            hand: Vec::new(),
+            battlefield: Vec::new(),
+            graveyard: Vec::new(),
+            lands_in_play: 0,
+            cards_seen: HashSet::new(),
+        };
+        let actions = attack_step(&mut active, &mut defending);
+        assert_eq!(defending.life, 18);
+        assert!(actions.iter().any(|a| a.contains("unblocked for 2 damage")));
     }
 }
