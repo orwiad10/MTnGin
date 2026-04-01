@@ -7,8 +7,10 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const SCRYFALL_BULK_ENDPOINT: &str = "https://api.scryfall.com/bulk-data";
+const HTTP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Parser)]
 #[command(name = "mtngin")]
@@ -160,7 +162,11 @@ fn init_scryfall_db(db_path: &Path) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(HTTP_USER_AGENT)
+        .timeout(Duration::from_secs(120))
+        .build()
+        .context("failed to create HTTP client")?;
     let bulk: ScryfallBulkResponse = client
         .get(SCRYFALL_BULK_ENDPOINT)
         .send()
