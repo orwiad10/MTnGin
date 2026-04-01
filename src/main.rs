@@ -110,6 +110,7 @@ struct PlayerState {
     battlefield: Vec<CreaturePermanent>,
     graveyard: Vec<DeckCard>,
     lands_in_play: u32,
+    tapped_lands: u32,
     mana_pool: u32,
     cards_seen: HashSet<String>,
 }
@@ -117,6 +118,7 @@ struct PlayerState {
 #[derive(Debug, Clone, Copy)]
 enum TurnPhase {
     Untap,
+    Upkeep,
     Draw,
     Main1,
     Combat,
@@ -128,6 +130,7 @@ impl TurnPhase {
     fn label(self) -> &'static str {
         match self {
             TurnPhase::Untap => "Untap",
+            TurnPhase::Upkeep => "Upkeep",
             TurnPhase::Draw => "Draw",
             TurnPhase::Main1 => "Main Phase 1",
             TurnPhase::Combat => "Combat",
@@ -198,7 +201,15 @@ struct PlayerTurnLog {
     hand_after: usize,
     battlefield_before: usize,
     battlefield_after: usize,
+    hand_contents_log: Vec<String>,
     actions: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+enum UpkeepTriggerEffect {
+    DrawCards(usize),
+    LoseLife(i32),
+    OpponentLosesLife(i32),
 }
 
 fn main() -> Result<()> {
@@ -439,6 +450,7 @@ fn simulate_game(
         battlefield: Vec::new(),
         graveyard: Vec::new(),
         lands_in_play: 0,
+        tapped_lands: 0,
         mana_pool: 0,
         cards_seen: HashSet::new(),
     };
@@ -451,6 +463,7 @@ fn simulate_game(
         battlefield: Vec::new(),
         graveyard: Vec::new(),
         lands_in_play: 0,
+        tapped_lands: 0,
         mana_pool: 0,
         cards_seen: HashSet::new(),
     };
@@ -535,6 +548,7 @@ fn simulate_game_yard(
         battlefield: Vec::new(),
         graveyard: Vec::new(),
         lands_in_play: 1,
+        tapped_lands: 0,
         mana_pool: 0,
         cards_seen: HashSet::new(),
     };
@@ -546,6 +560,7 @@ fn simulate_game_yard(
         battlefield: Vec::new(),
         graveyard: Vec::new(),
         lands_in_play: 1,
+        tapped_lands: 0,
         mana_pool: 0,
         cards_seen: HashSet::new(),
     };
@@ -634,19 +649,44 @@ fn take_turn_yard(
     shared_graveyard: &mut Vec<DeckCard>,
 ) -> PlayerTurnLog {
     let mut actions = Vec::new();
+    let mut hand_contents_log = vec![format!(
+        "Turn start hand: {}",
+        summarize_hand_contents(&active.hand)
+    )];
     let life_before = active.life;
     let hand_before = active.hand.len();
     let battlefield_before = active.battlefield.len();
 
     actions.push(format!("== {} ==", TurnPhase::Untap.label()));
     active.mana_pool = 0;
+    active.tapped_lands = 0;
     for c in &mut active.battlefield {
         c.summoning_sick = false;
     }
     actions.push("Untapped permanents and cleared summoning sickness.".to_string());
+    hand_contents_log.push(format!(
+        "After untap: {}",
+        summarize_hand_contents(&active.hand)
+    ));
+
+    actions.push(format!("== {} ==", TurnPhase::Upkeep.label()));
+    actions.extend(resolve_upkeep_triggers_yard(
+        active,
+        defending,
+        card_db,
+        shared_library,
+    ));
+    hand_contents_log.push(format!(
+        "After upkeep: {}",
+        summarize_hand_contents(&active.hand)
+    ));
 
     actions.push(format!("== {} ==", TurnPhase::Draw.label()));
     actions.push(draw_card_from_shared(active, shared_library));
+    hand_contents_log.push(format!(
+        "After draw: {}",
+        summarize_hand_contents(&active.hand)
+    ));
     if active.life <= 0 {
         return PlayerTurnLog {
             player_name: active.name.clone(),
@@ -656,6 +696,7 @@ fn take_turn_yard(
             hand_after: active.hand.len(),
             battlefield_before,
             battlefield_after: active.battlefield.len(),
+            hand_contents_log,
             actions,
         };
     }
@@ -682,6 +723,10 @@ fn take_turn_yard(
         card_db,
         shared_graveyard,
     ));
+    hand_contents_log.push(format!(
+        "After main 1: {}",
+        summarize_hand_contents(&active.hand)
+    ));
 
     actions.push(format!("== {} ==", TurnPhase::Combat.label()));
     actions.extend(attack_step_yard(active, defending, shared_graveyard));
@@ -692,6 +737,10 @@ fn take_turn_yard(
         card_db,
         shared_graveyard,
     ));
+    hand_contents_log.push(format!(
+        "After main 2: {}",
+        summarize_hand_contents(&active.hand)
+    ));
     actions.push(format!("== {} ==", TurnPhase::End.label()));
     active.mana_pool = 0;
     actions.extend(discard_down_to_hand_size_yard(
@@ -699,6 +748,10 @@ fn take_turn_yard(
         card_db,
         shared_graveyard,
         MAX_HAND_SIZE,
+    ));
+    hand_contents_log.push(format!(
+        "End hand: {}",
+        summarize_hand_contents(&active.hand)
     ));
     PlayerTurnLog {
         player_name: active.name.clone(),
@@ -708,6 +761,7 @@ fn take_turn_yard(
         hand_after: active.hand.len(),
         battlefield_before,
         battlefield_after: active.battlefield.len(),
+        hand_contents_log,
         actions,
     }
 }
@@ -718,19 +772,39 @@ fn take_turn(
     card_db: &HashMap<String, CardProfile>,
 ) -> PlayerTurnLog {
     let mut actions = Vec::new();
+    let mut hand_contents_log = vec![format!(
+        "Turn start hand: {}",
+        summarize_hand_contents(&active.hand)
+    )];
     let life_before = active.life;
     let hand_before = active.hand.len();
     let battlefield_before = active.battlefield.len();
 
     actions.push(format!("== {} ==", TurnPhase::Untap.label()));
     active.mana_pool = 0;
+    active.tapped_lands = 0;
     for c in &mut active.battlefield {
         c.summoning_sick = false;
     }
     actions.push("Untapped permanents and cleared summoning sickness.".to_string());
+    hand_contents_log.push(format!(
+        "After untap: {}",
+        summarize_hand_contents(&active.hand)
+    ));
+
+    actions.push(format!("== {} ==", TurnPhase::Upkeep.label()));
+    actions.extend(resolve_upkeep_triggers(active, defending, card_db));
+    hand_contents_log.push(format!(
+        "After upkeep: {}",
+        summarize_hand_contents(&active.hand)
+    ));
 
     actions.push(format!("== {} ==", TurnPhase::Draw.label()));
     actions.push(draw_card(active));
+    hand_contents_log.push(format!(
+        "After draw: {}",
+        summarize_hand_contents(&active.hand)
+    ));
     if active.life <= 0 {
         return PlayerTurnLog {
             player_name: active.name.clone(),
@@ -740,6 +814,7 @@ fn take_turn(
             hand_after: active.hand.len(),
             battlefield_before,
             battlefield_after: active.battlefield.len(),
+            hand_contents_log,
             actions,
         };
     }
@@ -749,13 +824,25 @@ fn take_turn(
         actions.push(action);
     }
     actions.extend(cast_spells(active, defending, card_db));
+    hand_contents_log.push(format!(
+        "After main 1: {}",
+        summarize_hand_contents(&active.hand)
+    ));
     actions.push(format!("== {} ==", TurnPhase::Combat.label()));
     actions.extend(attack_step(active, defending));
     actions.push(format!("== {} ==", TurnPhase::Main2.label()));
     actions.extend(cast_spells(active, defending, card_db));
+    hand_contents_log.push(format!(
+        "After main 2: {}",
+        summarize_hand_contents(&active.hand)
+    ));
     actions.push(format!("== {} ==", TurnPhase::End.label()));
     active.mana_pool = 0;
     actions.extend(discard_down_to_hand_size(active, card_db, MAX_HAND_SIZE));
+    hand_contents_log.push(format!(
+        "End hand: {}",
+        summarize_hand_contents(&active.hand)
+    ));
     PlayerTurnLog {
         player_name: active.name.clone(),
         life_before,
@@ -764,6 +851,7 @@ fn take_turn(
         hand_after: active.hand.len(),
         battlefield_before,
         battlefield_after: active.battlefield.len(),
+        hand_contents_log,
         actions,
     }
 }
@@ -790,6 +878,128 @@ fn draw_card_from_shared(player: &mut PlayerState, shared_library: &mut Vec<Deck
         player.life = 0;
         "Tried to draw from empty shared library and lost the game.".to_string()
     }
+}
+
+fn summarize_hand_contents(hand: &[DeckCard]) -> String {
+    if hand.is_empty() {
+        return "(empty)".to_string();
+    }
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for card in hand {
+        *counts.entry(card.name.clone()).or_insert(0) += 1;
+    }
+    let mut entries: Vec<(String, usize)> = counts.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+        .into_iter()
+        .map(|(name, count)| format!("{name} x{count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn available_mana(player: &PlayerState) -> u32 {
+    (player.lands_in_play.saturating_sub(player.tapped_lands)) + player.mana_pool
+}
+
+fn spend_mana(player: &mut PlayerState, amount: u32) {
+    let from_pool = amount.min(player.mana_pool);
+    player.mana_pool -= from_pool;
+    let mut remaining = amount - from_pool;
+    if remaining > 0 {
+        let untapped_lands = player.lands_in_play.saturating_sub(player.tapped_lands);
+        let tap_now = remaining.min(untapped_lands);
+        player.tapped_lands += tap_now;
+        remaining -= tap_now;
+    }
+    if remaining > 0 {
+        player.mana_pool = 0;
+    }
+}
+
+fn resolve_upkeep_triggers(
+    active: &mut PlayerState,
+    defending: &mut PlayerState,
+    card_db: &HashMap<String, CardProfile>,
+) -> Vec<String> {
+    let mut actions = Vec::new();
+    let mut queued: Vec<(String, UpkeepTriggerEffect)> = Vec::new();
+    for creature in &active.battlefield {
+        let key = normalize_name(&creature.card_name);
+        if let Some(profile) = card_db.get(&key) {
+            if let Some(effect) = upkeep_trigger_for_profile(profile) {
+                queued.push((profile.name.clone(), effect));
+            }
+        }
+    }
+
+    for (source, effect) in queued {
+        actions.push(format!("Upkeep trigger from {} goes on the stack.", source));
+        match effect {
+            UpkeepTriggerEffect::DrawCards(count) => {
+                for _ in 0..count {
+                    actions.push(draw_card(active));
+                }
+            }
+            UpkeepTriggerEffect::LoseLife(amount) => {
+                active.life -= amount;
+                actions.push(format!(
+                    "{} loses {} life from {} (life now {}).",
+                    active.name, amount, source, active.life
+                ));
+            }
+            UpkeepTriggerEffect::OpponentLosesLife(amount) => {
+                defending.life -= amount;
+                actions.push(format!(
+                    "{} loses {} life from {} trigger (life now {}).",
+                    defending.name, amount, source, defending.life
+                ));
+            }
+        }
+    }
+    actions
+}
+
+fn resolve_upkeep_triggers_yard(
+    active: &mut PlayerState,
+    defending: &mut PlayerState,
+    card_db: &HashMap<String, CardProfile>,
+    shared_library: &mut Vec<DeckCard>,
+) -> Vec<String> {
+    let mut actions = Vec::new();
+    let mut queued: Vec<(String, UpkeepTriggerEffect)> = Vec::new();
+    for creature in &active.battlefield {
+        let key = normalize_name(&creature.card_name);
+        if let Some(profile) = card_db.get(&key) {
+            if let Some(effect) = upkeep_trigger_for_profile(profile) {
+                queued.push((profile.name.clone(), effect));
+            }
+        }
+    }
+    for (source, effect) in queued {
+        actions.push(format!("Upkeep trigger from {} goes on the stack.", source));
+        match effect {
+            UpkeepTriggerEffect::DrawCards(count) => {
+                for _ in 0..count {
+                    actions.push(draw_card_from_shared(active, shared_library));
+                }
+            }
+            UpkeepTriggerEffect::LoseLife(amount) => {
+                active.life -= amount;
+                actions.push(format!(
+                    "{} loses {} life from {} (life now {}).",
+                    active.name, amount, source, active.life
+                ));
+            }
+            UpkeepTriggerEffect::OpponentLosesLife(amount) => {
+                defending.life -= amount;
+                actions.push(format!(
+                    "{} loses {} life from {} trigger (life now {}).",
+                    defending.name, amount, source, defending.life
+                ));
+            }
+        }
+    }
+    actions
 }
 
 fn discard_down_to_hand_size(
@@ -845,6 +1055,23 @@ fn choose_discard_index(player: &PlayerState, card_db: &HashMap<String, CardProf
         .unwrap_or(0)
 }
 
+fn alternate_casting_cost(card_name: &str, base_cmc: u32) -> u32 {
+    match normalize_name(card_name).as_str() {
+        "street wraith" => 0,
+        "contagion" => 0,
+        _ => base_cmc,
+    }
+}
+
+fn upkeep_trigger_for_profile(profile: &CardProfile) -> Option<UpkeepTriggerEffect> {
+    match normalize_name(&profile.name).as_str() {
+        "phyrexian arena" => Some(UpkeepTriggerEffect::DrawCards(1)),
+        "sulfuric vortex" => Some(UpkeepTriggerEffect::OpponentLosesLife(2)),
+        "bitterblossom" => Some(UpkeepTriggerEffect::LoseLife(1)),
+        _ => None,
+    }
+}
+
 fn play_land(player: &mut PlayerState, card_db: &HashMap<String, CardProfile>) -> Option<String> {
     if let Some((idx, _)) = player
         .hand
@@ -870,9 +1097,9 @@ fn cast_spells(
     card_db: &HashMap<String, CardProfile>,
 ) -> Vec<String> {
     let mut actions = Vec::new();
-    let mut mana_available = active.lands_in_play + active.mana_pool;
 
     loop {
+        let mana_available = available_mana(active);
         let mut playable: Vec<(usize, u32)> = active
             .hand
             .iter()
@@ -908,7 +1135,7 @@ fn cast_spells(
         let card_name = card.name.clone();
 
         if let Some(profile) = card_profile_for(&card, card_db) {
-            mana_available = mana_available.saturating_sub(profile.cmc);
+            spend_mana(active, profile.cmc);
             active.cards_seen.insert(card.name.clone());
             let mut stack = vec![StackItem {
                 card,
@@ -928,7 +1155,6 @@ fn cast_spells(
             active.graveyard.push(DeckCard { name: card_name });
         }
     }
-    active.mana_pool = mana_available.saturating_sub(active.lands_in_play);
     actions
 }
 
@@ -939,9 +1165,9 @@ fn cast_spells_yard(
     shared_graveyard: &mut Vec<DeckCard>,
 ) -> Vec<String> {
     let mut actions = Vec::new();
-    let mut mana_available = active.lands_in_play + active.mana_pool;
 
     loop {
+        let mana_available = available_mana(active);
         let mut playable: Vec<(usize, u32)> = active
             .hand
             .iter()
@@ -965,10 +1191,10 @@ fn cast_spells_yard(
         let card_name = card.name.clone();
 
         if let Some(profile) = card_profile_for(&card, card_db) {
-            let effective_cost = effective_yard_cost(&card_name, profile.cmc);
-            mana_available = mana_available.saturating_sub(effective_cost);
+            let effective_cost = alternate_casting_cost(&card_name, profile.cmc);
+            spend_mana(active, effective_cost);
             if let CardKind::ManaRitual { mana } = profile.kind {
-                mana_available = mana_available.saturating_add(mana);
+                active.mana_pool = active.mana_pool.saturating_add(mana);
             }
             active.cards_seen.insert(card.name.clone());
             let mut stack = vec![StackItem {
@@ -989,7 +1215,6 @@ fn cast_spells_yard(
             shared_graveyard.push(DeckCard { name: card_name });
         }
     }
-    active.mana_pool = mana_available.saturating_sub(active.lands_in_play);
     actions
 }
 
@@ -999,7 +1224,7 @@ fn maybe_response_spell(
     card_db: &HashMap<String, CardProfile>,
     yard_mode: bool,
 ) -> Option<StackItem> {
-    let mana_available = responder.lands_in_play + responder.mana_pool;
+    let mana_available = available_mana(responder);
     let lethal_idx = responder.hand.iter().enumerate().find_map(|(i, card)| {
         let profile = card_profile_for(card, card_db)?;
         if profile.cmc > mana_available {
@@ -1016,11 +1241,11 @@ fn maybe_response_spell(
     let card = responder.hand.remove(lethal_idx);
     let profile = card_profile_for(&card, card_db)?.clone();
     let cost = if yard_mode {
-        effective_yard_cost(&card.name, profile.cmc)
+        alternate_casting_cost(&card.name, profile.cmc)
     } else {
         profile.cmc
     };
-    responder.mana_pool = (responder.lands_in_play + responder.mana_pool).saturating_sub(cost);
+    spend_mana(responder, cost);
     Some(StackItem { card, profile })
 }
 
@@ -1043,14 +1268,6 @@ fn choose_best_yard_spell(
         return *idx;
     }
     playable[0].0
-}
-
-fn effective_yard_cost(card_name: &str, base_cmc: u32) -> u32 {
-    match normalize_name(card_name).as_str() {
-        "street wraith" => 0,
-        "contagion" => 0,
-        _ => base_cmc,
-    }
 }
 
 fn cast_priority_spells_yard(
@@ -1140,7 +1357,7 @@ fn activate_mana_abilities_yard(
     {
         let need_mana = active.hand.iter().any(|c| {
             card_profile_for(c, card_db)
-                .map(|p| p.cmc > active.lands_in_play + active.mana_pool)
+                .map(|p| p.cmc > available_mana(active))
                 .unwrap_or(false)
         });
         if !need_mana {
@@ -1754,6 +1971,7 @@ mod tests {
             battlefield: Vec::new(),
             graveyard: Vec::new(),
             lands_in_play: 0,
+            tapped_lands: 0,
             mana_pool: 0,
             cards_seen: HashSet::new(),
         };
@@ -1777,6 +1995,7 @@ mod tests {
             }],
             graveyard: Vec::new(),
             lands_in_play: 0,
+            tapped_lands: 0,
             mana_pool: 0,
             cards_seen: HashSet::new(),
         };
@@ -1788,6 +2007,7 @@ mod tests {
             battlefield: Vec::new(),
             graveyard: Vec::new(),
             lands_in_play: 0,
+            tapped_lands: 0,
             mana_pool: 0,
             cards_seen: HashSet::new(),
         };
@@ -1837,6 +2057,7 @@ mod tests {
             battlefield: Vec::new(),
             graveyard: Vec::new(),
             lands_in_play: 0,
+            tapped_lands: 0,
             mana_pool: 0,
             cards_seen: HashSet::new(),
         };
