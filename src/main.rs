@@ -11,6 +11,8 @@ use std::time::Duration;
 
 const SCRYFALL_BULK_ENDPOINT: &str = "https://api.scryfall.com/bulk-data";
 const HTTP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+const STARTING_HAND_SIZE: usize = 7;
+const MAX_HAND_SIZE: usize = 7;
 
 #[derive(Parser)]
 #[command(name = "mtngin")]
@@ -456,7 +458,7 @@ fn simulate_game(
     p1.library.shuffle(rng);
     p2.library.shuffle(rng);
 
-    for _ in 0..7 {
+    for _ in 0..STARTING_HAND_SIZE {
         let _ = draw_card(&mut p1);
         let _ = draw_card(&mut p2);
     }
@@ -532,7 +534,7 @@ fn simulate_game_yard(
         hand: Vec::new(),
         battlefield: Vec::new(),
         graveyard: Vec::new(),
-        lands_in_play: 0,
+        lands_in_play: 1,
         mana_pool: 0,
         cards_seen: HashSet::new(),
     };
@@ -543,7 +545,7 @@ fn simulate_game_yard(
         hand: Vec::new(),
         battlefield: Vec::new(),
         graveyard: Vec::new(),
-        lands_in_play: 0,
+        lands_in_play: 1,
         mana_pool: 0,
         cards_seen: HashSet::new(),
     };
@@ -552,7 +554,7 @@ fn simulate_game_yard(
     shared_library.shuffle(rng);
     let mut shared_graveyard: Vec<DeckCard> = Vec::new();
 
-    for _ in 0..7 {
+    for _ in 0..STARTING_HAND_SIZE {
         let _ = draw_card_from_shared(&mut p1, &mut shared_library);
         let _ = draw_card_from_shared(&mut p2, &mut shared_library);
     }
@@ -692,6 +694,12 @@ fn take_turn_yard(
     ));
     actions.push(format!("== {} ==", TurnPhase::End.label()));
     active.mana_pool = 0;
+    actions.extend(discard_down_to_hand_size_yard(
+        active,
+        card_db,
+        shared_graveyard,
+        MAX_HAND_SIZE,
+    ));
     PlayerTurnLog {
         player_name: active.name.clone(),
         life_before,
@@ -747,6 +755,7 @@ fn take_turn(
     actions.extend(cast_spells(active, defending, card_db));
     actions.push(format!("== {} ==", TurnPhase::End.label()));
     active.mana_pool = 0;
+    actions.extend(discard_down_to_hand_size(active, card_db, MAX_HAND_SIZE));
     PlayerTurnLog {
         player_name: active.name.clone(),
         life_before,
@@ -781,6 +790,59 @@ fn draw_card_from_shared(player: &mut PlayerState, shared_library: &mut Vec<Deck
         player.life = 0;
         "Tried to draw from empty shared library and lost the game.".to_string()
     }
+}
+
+fn discard_down_to_hand_size(
+    player: &mut PlayerState,
+    card_db: &HashMap<String, CardProfile>,
+    max_hand_size: usize,
+) -> Vec<String> {
+    let mut actions = Vec::new();
+    while player.hand.len() > max_hand_size {
+        let discard_idx = choose_discard_index(player, card_db);
+        let card = player.hand.remove(discard_idx);
+        let card_name = card.name.clone();
+        player.graveyard.push(card);
+        actions.push(format!(
+            "Discarded {} to hand size ({}).",
+            card_name, max_hand_size
+        ));
+    }
+    actions
+}
+
+fn discard_down_to_hand_size_yard(
+    player: &mut PlayerState,
+    card_db: &HashMap<String, CardProfile>,
+    shared_graveyard: &mut Vec<DeckCard>,
+    max_hand_size: usize,
+) -> Vec<String> {
+    let mut actions = Vec::new();
+    while player.hand.len() > max_hand_size {
+        let discard_idx = choose_discard_index(player, card_db);
+        let card = player.hand.remove(discard_idx);
+        let card_name = card.name.clone();
+        put_in_yard_graveyard(player, card, shared_graveyard);
+        actions.push(format!(
+            "Discarded {} to hand size ({}).",
+            card_name, max_hand_size
+        ));
+    }
+    actions
+}
+
+fn choose_discard_index(player: &PlayerState, card_db: &HashMap<String, CardProfile>) -> usize {
+    player
+        .hand
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, card)| {
+            card_profile_for(card, card_db)
+                .map(|profile| profile.cmc)
+                .unwrap_or(0)
+        })
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
 }
 
 fn play_land(player: &mut PlayerState, card_db: &HashMap<String, CardProfile>) -> Option<String> {
@@ -1732,5 +1794,57 @@ mod tests {
         let actions = attack_step(&mut active, &mut defending);
         assert_eq!(defending.life, 18);
         assert!(actions.iter().any(|a| a.contains("unblocked for 2 damage")));
+    }
+
+    #[test]
+    fn test_discard_down_to_hand_size() {
+        let mut card_db = HashMap::new();
+        card_db.insert(
+            "dark ritual".to_string(),
+            CardProfile {
+                name: "Dark Ritual".to_string(),
+                kind: CardKind::ManaRitual { mana: 3 },
+                cmc: 1,
+                is_basic_land: false,
+                is_mono_black_legal: true,
+            },
+        );
+        card_db.insert(
+            "griselbrand".to_string(),
+            CardProfile {
+                name: "Griselbrand".to_string(),
+                kind: CardKind::Creature {
+                    power: 7,
+                    toughness: 7,
+                },
+                cmc: 8,
+                is_basic_land: false,
+                is_mono_black_legal: true,
+            },
+        );
+        let mut player = PlayerState {
+            name: "P1".to_string(),
+            life: 20,
+            library: Vec::new(),
+            hand: vec![
+                DeckCard {
+                    name: "Dark Ritual".to_string(),
+                },
+                DeckCard {
+                    name: "Griselbrand".to_string(),
+                },
+            ],
+            battlefield: Vec::new(),
+            graveyard: Vec::new(),
+            lands_in_play: 0,
+            mana_pool: 0,
+            cards_seen: HashSet::new(),
+        };
+
+        let actions = discard_down_to_hand_size(&mut player, &card_db, 1);
+        assert_eq!(player.hand.len(), 1);
+        assert_eq!(player.graveyard.len(), 1);
+        assert_eq!(player.graveyard[0].name, "Griselbrand");
+        assert!(actions[0].contains("Discarded Griselbrand"));
     }
 }
